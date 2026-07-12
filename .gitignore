@@ -27,3 +27,10 @@ vgcore.*
 # Operating system files
 .DS_Store
 Thumbs.db
+
+
+market_server
+market_client
+build/
+*.o
+*.out
