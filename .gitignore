@@ -31,6 +31,4 @@ Thumbs.db
 
 market_server
 market_client
-build/
-*.o
-*.out
+
