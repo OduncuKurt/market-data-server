@@ -48,5 +48,11 @@ target_compile_options(
 target_link_libraries(
     market_server
     PRIVATE
-	Threads::Threads
+        Threads::Threads
+)
+
+target_link_libraries(
+    market_client
+    PRIVATE
+        Threads::Threads
 )

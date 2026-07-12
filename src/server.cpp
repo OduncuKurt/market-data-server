@@ -1,21 +1,38 @@
-#include <arpa/inet.h>
+#include "MarketDataGenerator.hpp"
+
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
+#include <cctype>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <sys/socket.h>
+#include <thread>
+#include <unordered_set>
 #include <unistd.h>
-#include "MarketDataGenerator.hpp"
-#include <iomanip>
+#include <vector>
+
 namespace
 {
 constexpr int PORT = 8080;
 constexpr int BUFFER_SIZE = 1024;
-constexpr int LISTEN_BACKLOG = 5;
+constexpr int LISTEN_BACKLOG = 10;
+constexpr auto PRICE_UPDATE_INTERVAL = std::chrono::seconds(1);
+
+std::mutex logMutex;
+}
+
+void logMessage(const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(logMutex);
+    std::cout << message << '\n';
 }
 
 bool sendAll(int socketFd, const std::string& message)
@@ -28,7 +45,7 @@ bool sendAll(int socketFd, const std::string& message)
             socketFd,
             message.data() + totalSentBytes,
             message.size() - totalSentBytes,
-            0
+            MSG_NOSIGNAL
         );
 
         if (sentBytes == -1)
@@ -37,10 +54,6 @@ bool sendAll(int socketFd, const std::string& message)
             {
                 continue;
             }
-
-            std::cerr << "Veri gönderme hatası: "
-                      << std::strerror(errno)
-                      << '\n';
 
             return false;
         }
@@ -74,23 +87,104 @@ std::string buildSubscriptionList(
         return "SUBSCRIPTIONS EMPTY\n";
     }
 
-    std::string response = "SUBSCRIPTIONS ";
-    bool firstSymbol = true;
+    std::vector<std::string> sortedSubscriptions(
+        subscriptions.begin(),
+        subscriptions.end()
+    );
 
-    for (const std::string& symbol : subscriptions)
+    std::sort(
+        sortedSubscriptions.begin(),
+        sortedSubscriptions.end()
+    );
+
+    std::ostringstream response;
+    response << "SUBSCRIPTIONS ";
+
+    for (std::size_t index = 0;
+         index < sortedSubscriptions.size();
+         ++index)
     {
-        if (!firstSymbol)
+        if (index > 0)
         {
-            response += ',';
+            response << ',';
         }
 
-        response += symbol;
-        firstSymbol = false;
+        response << sortedSubscriptions[index];
     }
 
-    response += '\n';
+    response << '\n';
 
-    return response;
+    return response.str();
+}
+
+std::string buildSymbolsResponse(
+    const MarketDataGenerator& marketDataGenerator)
+{
+    std::vector<std::string> symbols =
+        marketDataGenerator.getSymbols();
+
+    std::sort(symbols.begin(), symbols.end());
+
+    std::ostringstream response;
+    response << "SYMBOLS ";
+
+    for (std::size_t index = 0; index < symbols.size(); ++index)
+    {
+        if (index > 0)
+        {
+            response << ',';
+        }
+
+        response << symbols[index];
+    }
+
+    response << '\n';
+
+    return response.str();
+}
+
+std::string buildMarketDataMessage(
+    const std::unordered_set<std::string>& subscriptions,
+    const MarketDataGenerator& marketDataGenerator)
+{
+    if (subscriptions.empty())
+    {
+        return {};
+    }
+
+    std::vector<std::string> sortedSubscriptions(
+        subscriptions.begin(),
+        subscriptions.end()
+    );
+
+    std::sort(
+        sortedSubscriptions.begin(),
+        sortedSubscriptions.end()
+    );
+
+    const auto now = std::chrono::system_clock::now();
+
+    const auto timestamp = std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+            now.time_since_epoch()
+        ).count();
+
+    std::ostringstream response;
+
+    for (const std::string& symbol : sortedSubscriptions)
+    {
+        response << "MARKET_DATA "
+                 << symbol
+                 << ' '
+                 << std::fixed
+                 << std::setprecision(2)
+                 << marketDataGenerator.getPrice(symbol)
+                 << ' '
+                 << timestamp
+                 << '\n';
+    }
+
+    return response.str();
 }
 
 std::string processCommand(
@@ -103,43 +197,54 @@ std::string processCommand(
 
     std::string command;
     std::string argument;
+    std::string extraArgument;
 
     commandStream >> command;
     commandStream >> argument;
+    commandStream >> extraArgument;
 
     command = toUpper(command);
     argument = toUpper(argument);
+
+    if (!extraArgument.empty())
+    {
+        return "ERROR TOO_MANY_ARGUMENTS\n";
+    }
 
     if (command == "PING")
     {
         return "PONG\n";
     }
+
+    if (command == "SYMBOLS")
+    {
+        return buildSymbolsResponse(marketDataGenerator);
+    }
+
     if (command == "PRICE")
     {
-    	if (argument.empty())
-    	{
-        	return "ERROR SYMBOL_REQUIRED\n";
-    	}
+        if (argument.empty())
+        {
+            return "ERROR SYMBOL_REQUIRED\n";
+        }
 
-    	if (!marketDataGenerator.hasSymbol(argument))
-    	{
-        	return "ERROR UNKNOWN_SYMBOL\n";
-    	}
+        if (!marketDataGenerator.hasSymbol(argument))
+        {
+            return "ERROR UNKNOWN_SYMBOL\n";
+        }
 
-    	const double price = marketDataGenerator.updatePrice(argument);
+        std::ostringstream response;
 
-	std::ostringstream response;
-
-    	response << "PRICE "
+        response << "PRICE "
                  << argument
-      	  	 << ' '
-             	 << std::fixed
-             	 << std::setprecision(2)
-            	 << price
-             	 << '\n';
+                 << ' '
+                 << std::fixed
+                 << std::setprecision(2)
+                 << marketDataGenerator.getPrice(argument)
+                 << '\n';
 
-    	return response.str();
-	}
+        return response.str();
+    }
 
     if (command == "SUBSCRIBE")
     {
@@ -148,15 +253,14 @@ std::string processCommand(
             return "ERROR SYMBOL_REQUIRED\n";
         }
 
-	if (!marketDataGenerator.hasSymbol(argument))
+        if (!marketDataGenerator.hasSymbol(argument))
         {
             return "ERROR UNKNOWN_SYMBOL\n";
         }
 
-        const auto [iterator, inserted] = subscriptions.insert(argument);
-        static_cast<void>(iterator);
+        const auto insertResult = subscriptions.insert(argument);
 
-        if (!inserted)
+        if (!insertResult.second)
         {
             return "ERROR ALREADY_SUBSCRIBED\n";
         }
@@ -171,7 +275,8 @@ std::string processCommand(
             return "ERROR SYMBOL_REQUIRED\n";
         }
 
-        const std::size_t removedCount = subscriptions.erase(argument);
+        const std::size_t removedCount =
+            subscriptions.erase(argument);
 
         if (removedCount == 0)
         {
@@ -186,27 +291,6 @@ std::string processCommand(
         return buildSubscriptionList(subscriptions);
     }
 
-if (command == "SYMBOLS")
-{
-    const std::vector<std::string> symbols =
-        marketDataGenerator.getSymbols();
-
-    std::string response = "SYMBOLS ";
-
-    for (std::size_t index = 0; index < symbols.size(); ++index)
-    {
-        if (index > 0)
-        {
-            response += ',';
-        }
-
-        response += symbols[index];
-    }
-
-    response += '\n';
-
-    return response;
-}
     if (command == "QUIT")
     {
         shouldDisconnect = true;
@@ -216,14 +300,233 @@ if (command == "SYMBOLS")
     return "ERROR UNKNOWN_COMMAND\n";
 }
 
+void handleClient(
+    int clientSocket,
+    sockaddr_in clientAddress,
+    MarketDataGenerator& marketDataGenerator)
+{
+    char clientIp[INET_ADDRSTRLEN] {};
+
+    inet_ntop(
+        AF_INET,
+        &clientAddress.sin_addr,
+        clientIp,
+        sizeof(clientIp)
+    );
+
+    const std::string clientDescription =
+        std::string(clientIp) +
+        ":" +
+        std::to_string(ntohs(clientAddress.sin_port));
+
+    logMessage("İstemci bağlandı: " + clientDescription);
+
+    const std::string welcomeMessage =
+        "WELCOME MARKET_DATA_SERVER\n"
+        "COMMANDS PING,SYMBOLS,PRICE,SUBSCRIBE,"
+        "UNSUBSCRIBE,LIST,QUIT\n";
+
+    if (!sendAll(clientSocket, welcomeMessage))
+    {
+        close(clientSocket);
+        return;
+    }
+
+    std::unordered_set<std::string> subscriptions;
+    std::string pendingData;
+    char buffer[BUFFER_SIZE] {};
+
+    bool shouldDisconnect = false;
+
+    auto nextMarketDataSend =
+        std::chrono::steady_clock::now() +
+        PRICE_UPDATE_INTERVAL;
+
+    while (!shouldDisconnect)
+    {
+        const auto now = std::chrono::steady_clock::now();
+
+        const auto remainingTime =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                nextMarketDataSend - now
+            );
+
+        const int timeoutMilliseconds =
+            remainingTime.count() > 0
+                ? static_cast<int>(remainingTime.count())
+                : 0;
+
+        pollfd socketPollDescriptor {};
+
+        socketPollDescriptor.fd = clientSocket;
+        socketPollDescriptor.events = POLLIN;
+
+        const int pollResult = poll(
+            &socketPollDescriptor,
+            1,
+            timeoutMilliseconds
+        );
+
+        if (pollResult == -1)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            break;
+        }
+
+        if (
+            socketPollDescriptor.revents &
+            (POLLERR | POLLHUP | POLLNVAL))
+        {
+            break;
+        }
+
+        if (socketPollDescriptor.revents & POLLIN)
+        {
+            const ssize_t receivedBytes = recv(
+                clientSocket,
+                buffer,
+                sizeof(buffer),
+                0
+            );
+
+            if (receivedBytes == 0)
+            {
+                break;
+            }
+
+            if (receivedBytes == -1)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+
+                break;
+            }
+
+            pendingData.append(
+                buffer,
+                static_cast<std::size_t>(receivedBytes)
+            );
+
+            std::size_t newlinePosition = std::string::npos;
+
+            while (
+                (newlinePosition = pendingData.find('\n'))
+                != std::string::npos)
+            {
+                std::string command = pendingData.substr(
+                    0,
+                    newlinePosition
+                );
+
+                pendingData.erase(
+                    0,
+                    newlinePosition + 1
+                );
+
+                if (!command.empty() && command.back() == '\r')
+                {
+                    command.pop_back();
+                }
+
+                if (command.empty())
+                {
+                    continue;
+                }
+
+                logMessage(
+                    "[" +
+                    clientDescription +
+                    "] Komut: " +
+                    command
+                );
+
+                const std::string response = processCommand(
+                    command,
+                    subscriptions,
+                    marketDataGenerator,
+                    shouldDisconnect
+                );
+
+                if (!sendAll(clientSocket, response))
+                {
+                    shouldDisconnect = true;
+                    break;
+                }
+            }
+        }
+
+        const auto currentTime =
+            std::chrono::steady_clock::now();
+
+        if (
+            !shouldDisconnect &&
+            currentTime >= nextMarketDataSend)
+        {
+            const std::string marketDataMessage =
+                buildMarketDataMessage(
+                    subscriptions,
+                    marketDataGenerator
+                );
+
+            if (
+                !marketDataMessage.empty() &&
+                !sendAll(clientSocket, marketDataMessage))
+            {
+                break;
+            }
+
+            do
+            {
+                nextMarketDataSend += PRICE_UPDATE_INTERVAL;
+            }
+            while (nextMarketDataSend <= currentTime);
+        }
+    }
+
+    close(clientSocket);
+
+    logMessage(
+        "İstemci ayrıldı: " +
+        clientDescription
+    );
+}
+
+void runPriceUpdater(MarketDataGenerator& marketDataGenerator)
+{
+    auto nextUpdate =
+        std::chrono::steady_clock::now() +
+        PRICE_UPDATE_INTERVAL;
+
+    while (true)
+    {
+        std::this_thread::sleep_until(nextUpdate);
+
+        marketDataGenerator.updateAllPrices();
+
+        nextUpdate += PRICE_UPDATE_INTERVAL;
+    }
+}
+
 int main()
 {
-    const int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    const int serverSocket = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0
+    );
+
     if (serverSocket == -1)
     {
-        std::cerr << "Socket oluşturulamadı: "
-                  << std::strerror(errno)
-                  << '\n';
+        std::cerr
+            << "Socket oluşturulamadı: "
+            << std::strerror(errno)
+            << '\n';
 
         return 1;
     }
@@ -237,9 +540,10 @@ int main()
             &reuseAddress,
             sizeof(reuseAddress)) == -1)
     {
-        std::cerr << "setsockopt başarısız: "
-                  << std::strerror(errno)
-                  << '\n';
+        std::cerr
+            << "setsockopt başarısız: "
+            << std::strerror(errno)
+            << '\n';
 
         close(serverSocket);
         return 1;
@@ -256,9 +560,10 @@ int main()
             reinterpret_cast<sockaddr*>(&serverAddress),
             sizeof(serverAddress)) == -1)
     {
-        std::cerr << "Bind başarısız: "
-                  << std::strerror(errno)
-                  << '\n';
+        std::cerr
+            << "Bind başarısız: "
+            << std::strerror(errno)
+            << '\n';
 
         close(serverSocket);
         return 1;
@@ -266,160 +571,68 @@ int main()
 
     if (listen(serverSocket, LISTEN_BACKLOG) == -1)
     {
-        std::cerr << "Listen başarısız: "
-                  << std::strerror(errno)
-                  << '\n';
+        std::cerr
+            << "Listen başarısız: "
+            << std::strerror(errno)
+            << '\n';
 
         close(serverSocket);
         return 1;
     }
 
-    std::cout << "Piyasa veri sunucusu 0.0.0.0:"
-              << PORT
-              << " adresinde dinleniyor..."
-              << '\n';
-
-    sockaddr_in clientAddress {};
-    socklen_t clientAddressLength = sizeof(clientAddress);
-
-    const int clientSocket = accept(
-        serverSocket,
-        reinterpret_cast<sockaddr*>(&clientAddress),
-        &clientAddressLength
-    );
-
-    if (clientSocket == -1)
-    {
-        std::cerr << "Accept başarısız: "
-                  << std::strerror(errno)
-                  << '\n';
-
-        close(serverSocket);
-        return 1;
-    }
-
-    char clientIp[INET_ADDRSTRLEN] {};
-
-    const char* convertedIp = inet_ntop(
-        AF_INET,
-        &clientAddress.sin_addr,
-        clientIp,
-        sizeof(clientIp)
-    );
-
-    if (convertedIp != nullptr)
-    {
-        std::cout << "İstemci bağlandı: "
-                  << clientIp
-                  << ':'
-                  << ntohs(clientAddress.sin_port)
-                  << '\n';
-    }
-
-    const std::string welcomeMessage =
-        "WELCOME MARKET_DATA_SERVER\n"
-        "COMMANDS PING,SYMBOLS,PRICE,SUBSCRIBE,UNSUBSCRIBE,LIST,QUIT\n";
-
-    if (!sendAll(clientSocket, welcomeMessage))
-    {
-        close(clientSocket);
-        close(serverSocket);
-        return 1;
-    }
-
-    std::unordered_set<std::string> subscriptions;
     MarketDataGenerator marketDataGenerator;
-    std::string pendingData;
-    char buffer[BUFFER_SIZE] {};
 
-    bool shouldDisconnect = false;
+    std::thread priceUpdaterThread(
+        runPriceUpdater,
+        std::ref(marketDataGenerator)
+    );
 
-    while (!shouldDisconnect)
+    priceUpdaterThread.detach();
+
+    logMessage(
+        "Piyasa veri sunucusu 0.0.0.0:" +
+        std::to_string(PORT) +
+        " adresinde dinleniyor..."
+    );
+
+    while (true)
     {
-        const ssize_t receivedBytes = recv(
-            clientSocket,
-            buffer,
-            sizeof(buffer),
-            0
+        sockaddr_in clientAddress {};
+        socklen_t clientAddressLength =
+            sizeof(clientAddress);
+
+        const int clientSocket = accept(
+            serverSocket,
+            reinterpret_cast<sockaddr*>(&clientAddress),
+            &clientAddressLength
         );
 
-        if (receivedBytes == 0)
-        {
-            std::cout << "İstemci bağlantıyı kapattı."
-                      << '\n';
-
-            break;
-        }
-
-        if (receivedBytes == -1)
+        if (clientSocket == -1)
         {
             if (errno == EINTR)
             {
                 continue;
             }
 
-            std::cerr << "Veri alma hatası: "
-                      << std::strerror(errno)
-                      << '\n';
+            std::cerr
+                << "Accept başarısız: "
+                << std::strerror(errno)
+                << '\n';
 
-            break;
+            continue;
         }
 
-        pendingData.append(
-            buffer,
-            static_cast<std::size_t>(receivedBytes)
+        std::thread clientThread(
+            handleClient,
+            clientSocket,
+            clientAddress,
+            std::ref(marketDataGenerator)
         );
 
-        std::size_t newlinePosition = std::string::npos;
-
-        while (
-            (newlinePosition = pendingData.find('\n'))
-            != std::string::npos)
-        {
-            std::string command = pendingData.substr(
-                0,
-                newlinePosition
-            );
-
-            pendingData.erase(
-                0,
-                newlinePosition + 1
-            );
-
-            if (!command.empty() && command.back() == '\r')
-            {
-                command.pop_back();
-            }
-
-            if (command.empty())
-            {
-                continue;
-            }
-
-            std::cout << "Komut alındı: "
-                      << command
-                      << '\n';
-
-            const std::string response = processCommand(
-                command,
-                subscriptions,
-		marketDataGenerator,
-                shouldDisconnect
-            );
-
-            if (!sendAll(clientSocket, response))
-            {
-                shouldDisconnect = true;
-                break;
-            }
-        }
+        clientThread.detach();
     }
 
-    close(clientSocket);
     close(serverSocket);
-
-    std::cout << "Sunucu kapatıldı."
-              << '\n';
 
     return 0;
 }

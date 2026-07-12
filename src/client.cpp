@@ -1,9 +1,13 @@
+#include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 namespace
@@ -23,7 +27,7 @@ bool sendAll(int socketFd, const std::string& message)
             socketFd,
             message.data() + totalSentBytes,
             message.size() - totalSentBytes,
-            0
+            MSG_NOSIGNAL
         );
 
         if (sentBytes == -1)
@@ -33,73 +37,106 @@ bool sendAll(int socketFd, const std::string& message)
                 continue;
             }
 
-            std::cerr << "Veri gönderme hatası: "
-                      << std::strerror(errno)
-                      << '\n';
+            std::cerr
+                << "Veri gönderme hatası: "
+                << std::strerror(errno)
+                << '\n';
 
             return false;
         }
 
-        totalSentBytes += static_cast<std::size_t>(sentBytes);
+        totalSentBytes +=
+            static_cast<std::size_t>(sentBytes);
     }
 
     return true;
 }
 
-bool receiveResponse(int socketFd)
+std::string toUpper(std::string value)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char character)
+        {
+            return static_cast<char>(
+                std::toupper(character)
+            );
+        }
+    );
+
+    return value;
+}
+
+void receiveMessages(
+    int socketFd,
+    std::atomic<bool>& running)
 {
     char buffer[BUFFER_SIZE] {};
 
-    const ssize_t receivedBytes = recv(
-        socketFd,
-        buffer,
-        sizeof(buffer) - 1,
-        0
-    );
-
-    if (receivedBytes == 0)
+    while (running)
     {
-        std::cout << "Sunucu bağlantıyı kapattı."
-                  << '\n';
+        const ssize_t receivedBytes = recv(
+            socketFd,
+            buffer,
+            sizeof(buffer) - 1,
+            0
+        );
 
-        return false;
-    }
-
-    if (receivedBytes == -1)
-    {
-        if (errno == EINTR)
+        if (receivedBytes == 0)
         {
-            return true;
+            std::cout
+                << "\nSunucu bağlantıyı kapattı."
+                << '\n';
+
+            running = false;
+            break;
         }
 
-        std::cerr << "Veri alma hatası: "
-                  << std::strerror(errno)
-                  << '\n';
+        if (receivedBytes == -1)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
 
-        return false;
+            if (running)
+            {
+                std::cerr
+                    << "\nVeri alma hatası: "
+                    << std::strerror(errno)
+                    << '\n';
+            }
+
+            running = false;
+            break;
+        }
+
+        buffer[receivedBytes] = '\0';
+
+        std::cout
+            << '\n'
+            << buffer
+            << "> "
+            << std::flush;
     }
-
-    buffer[receivedBytes] = '\0';
-
-    std::cout << buffer;
-
-    if (buffer[receivedBytes - 1] != '\n')
-    {
-        std::cout << '\n';
-    }
-
-    return true;
 }
 
 int main()
 {
-    const int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    const int clientSocket = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0
+    );
 
     if (clientSocket == -1)
     {
-        std::cerr << "Socket oluşturulamadı: "
-                  << std::strerror(errno)
-                  << '\n';
+        std::cerr
+            << "Socket oluşturulamadı: "
+            << std::strerror(errno)
+            << '\n';
 
         return 1;
     }
@@ -109,61 +146,61 @@ int main()
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(SERVER_PORT);
 
-    const int conversionResult = inet_pton(
-        AF_INET,
-        SERVER_IP,
-        &serverAddress.sin_addr
-    );
-
-    if (conversionResult <= 0)
+    if (inet_pton(
+            AF_INET,
+            SERVER_IP,
+            &serverAddress.sin_addr) <= 0)
     {
-        std::cerr << "IP adresi dönüştürülemedi."
-                  << '\n';
+        std::cerr
+            << "IP adresi dönüştürülemedi."
+            << '\n';
 
         close(clientSocket);
         return 1;
     }
 
-    std::cout << SERVER_IP
-              << ':'
-              << SERVER_PORT
-              << " adresine bağlanılıyor..."
-              << '\n';
+    std::cout
+        << SERVER_IP
+        << ':'
+        << SERVER_PORT
+        << " adresine bağlanılıyor..."
+        << '\n';
 
     if (connect(
             clientSocket,
             reinterpret_cast<sockaddr*>(&serverAddress),
             sizeof(serverAddress)) == -1)
     {
-        std::cerr << "Sunucuya bağlanılamadı: "
-                  << std::strerror(errno)
-                  << '\n';
+        std::cerr
+            << "Sunucuya bağlanılamadı: "
+            << std::strerror(errno)
+            << '\n';
 
         close(clientSocket);
         return 1;
     }
 
-    std::cout << "Sunucuya bağlanıldı."
-              << '\n';
+    std::cout
+        << "Sunucuya bağlanıldı."
+        << '\n';
 
-    if (!receiveResponse(clientSocket))
-    {
-        close(clientSocket);
-        return 1;
-    }
+    std::atomic<bool> running {true};
+
+    std::thread receiverThread(
+        receiveMessages,
+        clientSocket,
+        std::ref(running)
+    );
 
     std::string command;
 
-    while (true)
+    while (running)
     {
         std::cout << "> ";
 
         if (!std::getline(std::cin, command))
         {
-            std::cout << "\nGirdi akışı kapatıldı."
-                      << '\n';
-
-            break;
+            command = "QUIT";
         }
 
         if (command.empty())
@@ -175,24 +212,31 @@ int main()
 
         if (!sendAll(clientSocket, message))
         {
+            running = false;
             break;
         }
 
-        if (!receiveResponse(clientSocket))
-        {
-            break;
-        }
-
-        if (command == "QUIT" || command == "quit")
+        if (toUpper(command) == "QUIT")
         {
             break;
         }
     }
 
+    if (!running)
+    {
+        shutdown(clientSocket, SHUT_RDWR);
+    }
+
+    if (receiverThread.joinable())
+    {
+        receiverThread.join();
+    }
+
     close(clientSocket);
 
-    std::cout << "İstemci kapatıldı."
-              << '\n';
+    std::cout
+        << "İstemci kapatıldı."
+        << '\n';
 
     return 0;
 }
