@@ -1,0 +1,29 @@
+# Build outputs
+build/
+bin/
+obj/
+
+# Compiled files
+*.o
+*.out
+*.a
+*.so
+*.exe
+
+# Debug files
+core
+core.*
+vgcore.*
+
+# IDE settings
+.vscode/
+.idea/
+
+# Temporary files
+*.log
+*.tmp
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
