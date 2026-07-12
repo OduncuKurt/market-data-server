@@ -42,6 +42,30 @@ Response:
 SYMBOLS THYAO,ASELS,GARAN,AKBNK,SISE
 ```
 
+
+
+### PRICE
+
+Updates and returns the current simulated price of a market symbol.
+
+Request:
+
+```text
+PRICE THYAO
+```
+
+Response:
+
+```text
+PRICE THYAO 312.74
+```
+
+Possible errors:
+
+```text
+ERROR SYMBOL_REQUIRED
+ERROR UNKNOWN_SYMBOL
+```
 ### SUBSCRIBE
 
 Subscribes the client to a market symbol.

@@ -13,16 +13,16 @@ constexpr int SERVER_PORT = 8080;
 constexpr int BUFFER_SIZE = 1024;
 }
 
-bool sendAll(int socketFd, const char* data, std::size_t dataLength)
+bool sendAll(int socketFd, const std::string& message)
 {
     std::size_t totalSentBytes = 0;
 
-    while (totalSentBytes < dataLength)
+    while (totalSentBytes < message.size())
     {
         const ssize_t sentBytes = send(
             socketFd,
-            data + totalSentBytes,
-            dataLength - totalSentBytes,
+            message.data() + totalSentBytes,
+            message.size() - totalSentBytes,
             0
         );
 
@@ -41,6 +41,51 @@ bool sendAll(int socketFd, const char* data, std::size_t dataLength)
         }
 
         totalSentBytes += static_cast<std::size_t>(sentBytes);
+    }
+
+    return true;
+}
+
+bool receiveResponse(int socketFd)
+{
+    char buffer[BUFFER_SIZE] {};
+
+    const ssize_t receivedBytes = recv(
+        socketFd,
+        buffer,
+        sizeof(buffer) - 1,
+        0
+    );
+
+    if (receivedBytes == 0)
+    {
+        std::cout << "Sunucu bağlantıyı kapattı."
+                  << '\n';
+
+        return false;
+    }
+
+    if (receivedBytes == -1)
+    {
+        if (errno == EINTR)
+        {
+            return true;
+        }
+
+        std::cerr << "Veri alma hatası: "
+                  << std::strerror(errno)
+                  << '\n';
+
+        return false;
+    }
+
+    buffer[receivedBytes] = '\0';
+
+    std::cout << buffer;
+
+    if (buffer[receivedBytes - 1] != '\n')
+    {
+        std::cout << '\n';
     }
 
     return true;
@@ -70,20 +115,9 @@ int main()
         &serverAddress.sin_addr
     );
 
-    if (conversionResult == 0)
+    if (conversionResult <= 0)
     {
-        std::cerr << "Geçersiz IP adresi: "
-                  << SERVER_IP
-                  << '\n';
-
-        close(clientSocket);
-        return 1;
-    }
-
-    if (conversionResult == -1)
-    {
-        std::cerr << "IP adresi dönüştürme hatası: "
-                  << std::strerror(errno)
+        std::cerr << "IP adresi dönüştürülemedi."
                   << '\n';
 
         close(clientSocket);
@@ -96,13 +130,10 @@ int main()
               << " adresine bağlanılıyor..."
               << '\n';
 
-    const int connectionResult = connect(
-        clientSocket,
-        reinterpret_cast<sockaddr*>(&serverAddress),
-        sizeof(serverAddress)
-    );
-
-    if (connectionResult == -1)
+    if (connect(
+            clientSocket,
+            reinterpret_cast<sockaddr*>(&serverAddress),
+            sizeof(serverAddress)) == -1)
     {
         std::cerr << "Sunucuya bağlanılamadı: "
                   << std::strerror(errno)
@@ -115,17 +146,19 @@ int main()
     std::cout << "Sunucuya bağlanıldı."
               << '\n';
 
-    std::cout << "Mesaj yaz. Çıkmak için 'quit' yaz."
-              << '\n';
+    if (!receiveResponse(clientSocket))
+    {
+        close(clientSocket);
+        return 1;
+    }
 
-    std::string message;
-    char buffer[BUFFER_SIZE] {};
+    std::string command;
 
     while (true)
     {
         std::cout << "> ";
 
-        if (!std::getline(std::cin, message))
+        if (!std::getline(std::cin, command))
         {
             std::cout << "\nGirdi akışı kapatıldı."
                       << '\n';
@@ -133,66 +166,26 @@ int main()
             break;
         }
 
-        if (message == "quit")
-        {
-            std::cout << "Bağlantı kapatılıyor..."
-                      << '\n';
-
-            break;
-        }
-
-        if (message.empty())
+        if (command.empty())
         {
             continue;
         }
 
-        message.push_back('\n');
+        const std::string message = command + '\n';
 
-        if (!sendAll(
-                clientSocket,
-                message.data(),
-                message.size()))
+        if (!sendAll(clientSocket, message))
         {
             break;
         }
 
-        const ssize_t receivedBytes = recv(
-            clientSocket,
-            buffer,
-            sizeof(buffer) - 1,
-            0
-        );
-
-        if (receivedBytes == 0)
+        if (!receiveResponse(clientSocket))
         {
-            std::cout << "Sunucu bağlantıyı kapattı."
-                      << '\n';
-
             break;
         }
 
-        if (receivedBytes == -1)
+        if (command == "QUIT" || command == "quit")
         {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-
-            std::cerr << "Veri alma hatası: "
-                      << std::strerror(errno)
-                      << '\n';
-
             break;
-        }
-
-        buffer[receivedBytes] = '\0';
-
-        std::cout << "Sunucudan gelen: "
-                  << buffer;
-
-        if (buffer[receivedBytes - 1] != '\n')
-        {
-            std::cout << '\n';
         }
     }
 
